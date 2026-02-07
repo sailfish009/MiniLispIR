@@ -1,177 +1,219 @@
-# MiniLispIR v0.3 — Self-Learning Compiler Architecture
+# MiniLispIR v0.4 — Self-Improving Compiler Architecture
 
 ## Overview
 
-MiniLispIR is a self-learning compiler written entirely in LLVM IR. It implements a cyclic **ir-gen → ir-eval → feedback** loop that generates new IR function blocks, evaluates them, scores the results, and feeds successful blocks back into the generation pipeline. No GPU is required — all learning happens through symbolic evolution of AST structures at the IR level.
+MiniLispIR is a self-improving compiler written entirely in LLVM IR. It reads its own (or any) `.ll` source file, extracts function blocks, runs a cyclic **ir-gen → ir-eval → scoring → feedback** loop on each function, and writes an improved version to disk when convergence is detected. No GPU is required.
 
-## Cycle Engine
+## Self-Improvement Flow
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                        run_cycle(N)                          │
-│                                                              │
-│   ┌─────────┐    ┌──────────┐    ┌─────────┐    ┌────────┐  │
-│   │ IR-Gen  │───>│ IR-Eval  │───>│ Scoring │───>│Feedback│  │
-│   │         │    │          │    │         │    │        │  │
-│   │ generate│    │ lex/parse│    │validate │    │decide  │  │
-│   │ source  │    │ /eval    │    │+ assess │    │fate    │  │
-│   └────▲────┘    └──────────┘    └─────────┘    └───┬────┘  │
-│        │                                            │        │
-│        │         ┌──────────┐                       │        │
-│        └─────────│ Registry │◄──────────────────────┘        │
-│                  │(success  │                                 │
-│                  │ blocks)  │                                 │
-│                  └──────────┘                                 │
-└──────────────────────────────────────────────────────────────┘
+                         ┌─────────────────────┐
+                         │   Input: source.ll   │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │  Extract Functions   │
+                         │  (scan for "define") │
+                         └──────────┬──────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    │               │               │
+                    ▼               ▼               ▼
+              ┌──────────┐   ┌──────────┐   ┌──────────┐
+              │ func [0] │   │ func [1] │   │ func [N] │
+              └─────┬────┘   └─────┬────┘   └─────┬────┘
+                    │               │               │
+                    ▼               ▼               ▼
+         ┌─────────────────────────────────────────────────┐
+         │            Per-Function Cycle Engine             │
+         │                                                 │
+         │  ┌─────────┐  ┌────────┐  ┌───────┐  ┌──────┐  │
+         │  │ IR-Gen  ├─>│IR-Eval ├─>│ Score ├─>│ Feed ├──│──┐
+         │  └────▲────┘  └────────┘  └───────┘  │ back │  │  │
+         │       │                               └──┬───┘  │  │
+         │       │       ┌──────────┐               │      │  │
+         │       └───────┤ Registry │<──────────────┘      │  │
+         │               └──────────┘                      │  │
+         │                                                 │  │
+         │  Converge when plateau_count >= patience (5)    │  │
+         └─────────────────────────────────────────────────┘  │
+                    │                                          │
+                    ▼                                          │
+         ┌─────────────────────┐                              │
+         │ Patch improved funcs│<─────────────────────────────┘
+         │ into source text    │
+         └──────────┬──────────┘
+                    │
+                    ▼
+         ┌─────────────────────┐
+         │ Output: improved.ll │
+         └─────────────────────┘
 ```
 
 ## Pipeline Stages
 
-### 1. IR-Gen (`@ir_gen`)
+### 1. Source Loading (`@read_file`)
 
-Produces new source programs through two strategies:
+Reads the entire `.ll` file into memory using `fopen`/`fread`/`ftell`. Accepts input and output paths via command-line arguments:
 
-- **Seed selection**: Randomly picks from 8 predefined seed programs covering arithmetic, variable binding, and nested expressions.
-- **Mutation**: When the registry contains successful blocks, there is a 50% chance of mutating an existing block instead of picking a fresh seed.
-
-Five mutation strategies are available:
-
-| Strategy | Transformation | Example |
-|----------|---------------|---------|
-| `grow-extend` | `(let v <rand> <existing>)` | Add a variable binding layer |
-| `arith-variant` | `(+ <existing> <rand>)` | Extend with arithmetic |
-| `chain-calls` | `(display <existing>)` | Wrap in an output call |
-| `nest-deeper` | `(* <existing> 2)` | Scale the result |
-| `decrement` | `(- <existing> 1)` | Subtract from the result |
-
-### 2. IR-Eval (`@ir_eval`)
-
-Executes the generated source through the full compilation pipeline:
-
-```
-source string → lexer → tokens → parser → AST → eval_node → result
+```bash
+./minilisp input.ll output_improved.ll
+# or use defaults:
+./minilisp   # reads minilisp_ir.ll, writes minilisp_ir_improved.ll
 ```
 
-Returns an `%eval_result_ty` struct:
+### 2. Function Extraction (`@extract_functions`)
+
+Scans the source text for lines starting with `"define "`, then tracks brace depth (`{`/`}`) to find the complete function body. For each function, it creates a `%func_seg_ty` record:
 
 ```llvm
-%eval_result_ty = type { i8* value, i32 is_valid, i32 numeric_result }
+%func_seg_ty = type {
+  i8*,  ; name            - function name (e.g., "vector_push")
+  i64,  ; start_offset    - byte offset in source
+  i64,  ; end_offset      - byte offset of closing }
+  i8*,  ; text            - original function text
+  i32,  ; score           - best score achieved
+  i8*   ; improved_text   - improved version (null if no improvement)
+}
 ```
+
+### 3. Per-Function Improvement Cycle
+
+For each extracted function, up to **10 cycles** of ir-gen/ir-eval are run:
+
+#### IR-Gen (`@ir_gen`)
+- **Seed selection**: 8 predefined Lisp programs covering arithmetic, binding, and nesting.
+- **Mutation**: 50% chance to mutate a successful block from the registry.
+- 5 mutation strategies: `grow-extend`, `arith-variant`, `chain-calls`, `nest-deeper`, `decrement`.
+
+#### IR-Eval (`@ir_eval`)
+Full pipeline: `source → lexer → parser → AST → eval_node → result`
+
+Returns `%eval_result_ty { i8* value, i32 is_valid, i32 numeric_result }`.
 
 Supported operations: `let`, `display`, `+`, `-`, `*`, `if`, `compile`.
 
-### 3. Scoring (`@ir_score`)
-
-Quantifies the quality of an evaluation result:
+#### Scoring (`@ir_score`)
 
 | Criterion | Points |
 |-----------|--------|
-| Valid execution (eval succeeded) | +10 |
+| Valid execution | +10 |
 | Non-zero result | +5 |
-| \|result\| > 10 (nontrivial magnitude) | +3 |
-| Even result (structural property) | +2 |
+| \|result\| > 10 | +3 |
+| Even result | +2 |
 | Generation bonus | +generation |
 
-### 4. Feedback (`@ir_feedback`)
+#### Convergence Detection
 
-Determines the fate of each block based on its score:
+- **Improvement threshold**: score delta must be > 2 to count as improvement.
+- **Plateau counter**: increments each cycle without improvement.
+- **Patience**: after 5 consecutive non-improving cycles, the function is considered converged.
+- On improvement, the plateau counter resets and the block enters the registry.
 
-- **Threshold** = `12 + generation` (selection pressure increases over time)
-- `score >= threshold` → **KEEP** (stored in registry)
-- `score >= 20` → **KEEP + MUTATE** candidate (used as raw material for the next generation)
-- `score < threshold` → **DISCARD**
+### 4. Source Patching (`@patch_source`)
+
+Replaces a byte range `[start, end)` in the source text with new text. Uses `memcpy` to construct: `prefix + new_text + suffix`. Offset arithmetic accounts for length differences between old and new text.
+
+### 5. Output Writing (`@write_file`)
+
+Writes the final patched source to disk via `fopen`/`fwrite`. Reports bytes written.
 
 ## Data Structures
 
-### IR Block
+### IR Block (Registry Entry)
 
 ```llvm
 %ir_block_ty = type { i8* name, i8* source, i8* ir_text, i32 score, i32 generation, i32 status }
-; status: 0 = pending, 1 = ok, 2 = fail
 ```
-
-Each block stores the original source, the generated IR text, its score, the generation it was created in, and its validation status.
 
 ### Registry
 
-A dynamic vector (`%vector_ty`) of successful IR blocks. Blocks in the registry serve as building material for future generations via mutation.
+A `%vector_ty` of successful `%ir_block_ty` pointers. Shared across all function improvement cycles — blocks discovered while improving one function can be reused as mutation material for subsequent functions.
 
 ### Environment
 
-A linked list (`%env_ty`) used during evaluation for variable bindings introduced by `let` expressions.
+Linked list `%env_ty` for `let` variable bindings during evaluation.
 
-## Example Output
+## Example Session
 
 ```
-=== Cycle 0 / 20 ===============
-[ir-gen]  function: (let a 3 (let b 7 (+ a b)))
-[ir-eval] result:   10
-[score]   value:    15
-[status]  KEEP
-[best]    score=15  gen=0
--------------------------------------------
+===== MiniLispIR v0.4 Self-Improving Compiler =====
 
-=== Cycle 1 / 20 ===============
-[mutate]  strategy: arith-variant
-[ir-gen]  function: (+ (let a 3 (let b 7 (+ a b))) 42)
-[ir-eval] result:   52
-[score]   value:    21
-[status]  KEEP
-[best]    score=21  gen=1
--------------------------------------------
+[load]   source: minilisp_ir.ll (45230 bytes)
+[extract] found 36 function blocks
+[target] function: vector_new
 
-=== Cycle 5 / 20 ===============
-[mutate]  strategy: grow-extend
-[ir-gen]  function: (let v 73 (+ (let a 3 (let b 7 (+ a b))) 42))
-[ir-eval] result:   52
-[score]   value:    25
-[status]  KEEP
--------------------------------------------
+--- Cycle 0 / 10 (gen 0) ----------------
+[ir-gen]   candidate: (let a 3 (let b 7 (+ a b)))
+[ir-eval]  result:    10
+[score]    value:     15
+[IMPROVED] vector_new: 0 -> 15 (+15)
 
-=== Final Registry: 12 successful blocks ===
-  [0] score=15  gen=0  name=(let a 3 (let b 7 (+ a b)))
-  [1] score=21  gen=1  name=(+ (let a 3 (let b 7 (+ a b))) 42)
-  ...
-[best]    score=25  gen=5
+--- Cycle 1 / 10 (gen 1) ----------------
+[ir-gen]   candidate: (+ (let a 3 (let b 7 (+ a b))) 42)
+[ir-eval]  result:    52
+[score]    value:     21
+[IMPROVED] vector_new: 15 -> 21 (+6)
+
+--- Cycle 2 / 10 (gen 2) ----------------
+[ir-gen]   candidate: (let x 6 (* x 7))
+[ir-eval]  result:    42
+[score]    value:     22
+[skip]     no improvement
+
+...
+
+[CONVERGE] plateau for 5 cycles, saving...
+[target] function: vector_push
+...
+
+[save]   output: minilisp_ir_improved.ll (45892 bytes)
+
+===== Summary: 12 functions improved, delta=187 =====
 ```
-
-## Self-Learning Mechanism
-
-The system follows a genetic programming approach where programs themselves are the evolving entities:
-
-1. **Exploration** — Start from seed programs and generate diverse program structures.
-2. **Evaluation** — Verify that generated code actually executes successfully.
-3. **Selection** — Only blocks that pass the scoring threshold survive into the registry.
-4. **Evolution** — Surviving blocks are mutated to produce more complex programs.
-5. **Pressure** — The passing threshold increases with each generation, driving higher-quality output over time.
-
-## Why No GPU
-
-All "learning" is symbolic, operating at the IR level:
-
-- **AST structures** evolve instead of neural network weights.
-- **Score-based selection** replaces backpropagation.
-- **Sequential per-generation execution** replaces batch processing.
-
-This is closer to genetic programming than deep learning — the programs themselves are the population being evolved.
 
 ## Building and Running
 
 ```bash
-# Compile with Clang/LLVM
-clang minilisp_ir_v03.ll -o minilisp -lm
+# Compile
+clang minilisp_ir_v04.ll -o minilisp -lm
 
-# Run (executes 20 generations by default)
+# Run with defaults (reads minilisp_ir.ll, writes minilisp_ir_improved.ll)
 ./minilisp
+
+# Run with explicit paths
+./minilisp my_compiler.ll my_compiler_improved.ll
+
+# Bootstrap: feed output back as input
+./minilisp minilisp_ir_improved.ll minilisp_ir_v2.ll
 ```
 
-The RNG is seeded from `time()`, so each run produces different results. To get reproducible runs, modify the seed in `@main`.
+## Self-Learning Mechanism
+
+1. **Exploration** — Generate diverse programs from seeds and mutations.
+2. **Evaluation** — Execute each candidate through the full lex/parse/eval pipeline.
+3. **Selection** — Only candidates that exceed the current best score (by > 2) survive.
+4. **Convergence** — Stop when no improvement is found for 5 consecutive attempts.
+5. **Persistence** — Write improved source to disk for the next bootstrap iteration.
+
+The cross-function registry creates a compounding effect: improvements found for early functions become mutation material for later ones, enabling progressively more complex programs to emerge.
+
+## Why No GPU
+
+All computation is symbolic at the IR level:
+
+- **AST structures** evolve instead of neural network weights.
+- **Score-based selection** replaces backpropagation.
+- **Sequential execution** replaces batch/parallel processing.
+
+This is genetic programming applied to compiler IR — programs evolve through mutation and selection pressure.
 
 ## Roadmap
 
-- **`lambda` support** — Evolve function definitions and higher-order calls.
-- **Type validation** — Add type safety scoring in IR-Eval.
-- **Crossover** — Combine subtrees from two successful blocks.
-- **Full self-reference** — Feed codegen'd IR text back through eval for a complete quine-like loop.
-- **Goal-directed generation** — Search backward from a target output value.
-- **GPU acceleration** — Parallel evaluation of candidate blocks (future).
+- [ ] **`lambda` support** — Evolve function definitions and higher-order calls
+- [ ] **Crossover** — Combine subtrees from two successful blocks
+- [ ] **Full self-reference** — Feed codegen'd IR back through eval (quine-like loop)
+- [ ] **Goal-directed generation** — Reverse search from target output values
+- [ ] **Multi-pass bootstrap** — Automated repeated self-compilation with convergence tracking
+- [ ] **GPU acceleration** — Parallel candidate evaluation (future)
